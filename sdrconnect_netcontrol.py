@@ -11,6 +11,7 @@ Defaults:
 
 Useful options:
   --frequency-property device_center_frequency
+  --refresh-interval 0.25
   --listen-port 4533
   --verbose
 
@@ -56,11 +57,14 @@ HAMLIB_TO_SDR_MODE = {
 @dataclass
 class BridgeState:
     frequency_hz: int = 0
+    actual_frequency_hz: int = 0
+    last_commanded_frequency_hz: int = 0
     mode: str = "NFM"
     passband_hz: int = 15000
     vfo: str = "VFOA"
     ptt: bool = False
     connected: bool = False
+    started: bool = False
 
 
 class SDRConnectClient:
@@ -71,6 +75,7 @@ class SDRConnectClient:
         frequency_property: str,
         state: BridgeState,
         request_timeout: float,
+        refresh_interval: float,
     ) -> None:
         self.host = "127.0.0.1"
         self.port = port
@@ -79,6 +84,7 @@ class SDRConnectClient:
         self.frequency_property = frequency_property
         self.state = state
         self.request_timeout = request_timeout
+        self.refresh_interval = refresh_interval
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._lock = asyncio.Lock()
@@ -88,14 +94,17 @@ class SDRConnectClient:
 
     async def run(self) -> None:
         while not self._stop.is_set():
+            refresh_task: asyncio.Task[None] | None = None
             try:
                 logging.info("Connecting to SDRConnect at %s", self.uri)
                 self._reader, self._writer = await self._connect()
                 self.state.connected = True
                 logging.info("Connected to SDRConnect")
-                for property_name in (self.frequency_property, "demodulator", "filter_bandwidth"):
+                for property_name in ("started", self.frequency_property, "demodulator", "filter_bandwidth"):
                     with contextlib.suppress(Exception):
                         await self.request_property(property_name)
+                if self.refresh_interval > 0:
+                    refresh_task = asyncio.create_task(self._refresh_frequency_cache())
                 while not self._stop.is_set():
                     opcode, payload = await self._read_frame()
                     if opcode == 0x1:
@@ -107,6 +116,10 @@ class SDRConnectClient:
             except Exception as exc:
                 logging.warning("SDRConnect connection failed: %s", exc)
             finally:
+                if refresh_task is not None:
+                    refresh_task.cancel()
+                    with contextlib.suppress(Exception):
+                        await refresh_task
                 self.state.connected = False
                 if self._writer is not None:
                     self._writer.close()
@@ -123,6 +136,20 @@ class SDRConnectClient:
     def stop(self) -> None:
         self._stop.set()
 
+    async def _refresh_frequency_cache(self) -> None:
+        while not self._stop.is_set():
+            await asyncio.sleep(self.refresh_interval)
+            if not self.state.connected:
+                continue
+            try:
+                await self.request_property("started")
+                if self.state.started:
+                    await self.request_property(self.frequency_property)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.debug("Frequency cache refresh failed: %s", exc)
+
     def _handle_message(self, raw: str) -> None:
         logging.debug("SDRConnect recv: %s", raw)
         try:
@@ -136,17 +163,50 @@ class SDRConnectClient:
         value = str(message.get("value", ""))
 
         if event_type in {"property_changed", "get_property_response"}:
-            self._update_cache(property_name, value)
+            self._update_cache(property_name, value, source=event_type)
 
         if event_type == "get_property_response":
             future = self._pending_gets.pop(property_name, None)
             if future and not future.done():
                 future.set_result(value)
 
-    def _update_cache(self, property_name: str, value: str) -> None:
+    def _update_cache(self, property_name: str, value: str, source: str = "local") -> None:
         if property_name == self.frequency_property:
             with contextlib.suppress(ValueError):
-                self.state.frequency_hz = int(float(value))
+                frequency_hz = int(float(value))
+                if source == "set_property":
+                    self.state.last_commanded_frequency_hz = frequency_hz
+                    if frequency_hz != self.state.frequency_hz:
+                        self.state.frequency_hz = frequency_hz
+                        logging.info(
+                            "SDRConnect frequency update (%s): %s Hz",
+                            source,
+                            frequency_hz,
+                        )
+                    return
+
+                self.state.actual_frequency_hz = frequency_hz
+                if self.state.started and frequency_hz != self.state.frequency_hz:
+                    self.state.frequency_hz = frequency_hz
+                    logging.info(
+                        "SDRConnect frequency update (%s): %s Hz",
+                        source,
+                        frequency_hz,
+                    )
+        elif property_name == "started":
+            started = value.strip().lower() == "true"
+            if started != self.state.started:
+                self.state.started = started
+                logging.info("SDRConnect started: %s", started)
+            if self.state.started:
+                if self.state.actual_frequency_hz != self.state.frequency_hz:
+                    self.state.frequency_hz = self.state.actual_frequency_hz
+                    logging.info(
+                        "SDRConnect frequency update (started): %s Hz",
+                        self.state.frequency_hz,
+                    )
+            elif self.state.last_commanded_frequency_hz > 0:
+                self.state.frequency_hz = self.state.last_commanded_frequency_hz
         elif property_name == "demodulator" and value:
             self.state.mode = value.upper()
         elif property_name == "filter_bandwidth":
@@ -162,7 +222,7 @@ class SDRConnectClient:
                 "value": str(value),
             }
         )
-        self._update_cache(property_name, str(value))
+        self._update_cache(property_name, str(value), source="set_property")
 
     async def request_property(self, property_name: str) -> str:
         async with self._request_lock:
@@ -381,13 +441,11 @@ class RigctlServer:
         if frequency <= 0:
             raise ValueError
         await self.sdr.send_property(self.sdr.frequency_property, frequency)
+        self.state.last_commanded_frequency_hz = frequency
         self.state.frequency_hz = frequency
         return HAMLIB_OK, False
 
     async def _get_freq(self, args: list[str]) -> tuple[str, bool]:
-        with contextlib.suppress(Exception):
-            value = await self.sdr.request_property(self.sdr.frequency_property)
-            self.state.frequency_hz = int(float(value))
         return f"{self.state.frequency_hz}\n", False
 
     async def _set_mode(self, args: list[str]) -> tuple[str, bool]:
@@ -479,6 +537,12 @@ def parse_args() -> argparse.Namespace:
         choices=["device_vfo_frequency", "device_center_frequency"],
         help="SDRConnect frequency property to control",
     )
+    parser.add_argument(
+        "--refresh-interval",
+        type=float,
+        default=0.25,
+        help="seconds between background SDRConnect frequency cache refreshes; 0 disables it",
+    )
     parser.add_argument("--request-timeout", type=float, default=1.5, help="seconds to wait for get_property")
     parser.add_argument("--verbose", action="store_true", help="enable debug logging")
     return parser.parse_args()
@@ -498,6 +562,7 @@ async def main() -> None:
         frequency_property=args.frequency_property,
         state=state,
         request_timeout=args.request_timeout,
+        refresh_interval=args.refresh_interval,
     )
     rigctl = RigctlServer(args.listen_host, args.listen_port, state, sdr)
 
