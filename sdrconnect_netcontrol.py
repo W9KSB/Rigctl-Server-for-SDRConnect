@@ -91,6 +91,7 @@ class SDRConnectClient:
         self._request_lock = asyncio.Lock()
         self._pending_gets: dict[str, asyncio.Future[str]] = {}
         self._stop = asyncio.Event()
+        self._action_lock = asyncio.Lock()
 
     async def run(self) -> None:
         while not self._stop.is_set():
@@ -223,6 +224,27 @@ class SDRConnectClient:
             }
         )
         self._update_cache(property_name, str(value), source="set_property")
+
+    async def send_event(self, event_type: str, value: str | int | float = "", property_name: str = "") -> None:
+        await self._send(
+            {
+                "event_type": event_type,
+                "property": property_name,
+                "device": self.device,
+                "value": str(value),
+            }
+        )
+
+    async def start_audio_recording(self) -> None:
+        async with self._action_lock:
+            await self.send_property("audio_mute", "false")
+            await self.send_event("device_stream_enable", "true")
+            await self.send_event("start_recording", "audio")
+
+    async def stop_audio_recording(self) -> None:
+        async with self._action_lock:
+            await self.send_event("stop_recording")
+            await self.send_event("device_stream_enable", "false")
 
     async def request_property(self, property_name: str) -> str:
         async with self._request_lock:
@@ -523,12 +545,126 @@ class RigctlServer:
         )
 
 
+class ControlApiServer:
+    def __init__(self, listen_host: str, listen_port: int, sdr: SDRConnectClient) -> None:
+        self.listen_host = listen_host
+        self.listen_port = listen_port
+        self.sdr = sdr
+        self._server: asyncio.AbstractServer | None = None
+
+    async def run(self) -> None:
+        self._server = await asyncio.start_server(
+            self._handle_client,
+            host=self.listen_host,
+            port=self.listen_port,
+        )
+        sockets = ", ".join(str(sock.getsockname()) for sock in self._server.sockets or [])
+        logging.info("Listening for HTTP control API on %s", sockets)
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def _handle_client(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        peer = writer.get_extra_info("peername")
+        try:
+            method, path, content_length = await self._read_request(reader)
+            if content_length > 0:
+                await reader.readexactly(content_length)
+
+            logging.info("HTTP API request: %s %s from %s", method, path, peer)
+            if method != "POST":
+                await self._send_response(writer, 405, {"ok": False, "error": "method_not_allowed"})
+                return
+
+            if path == "/api/start-audio-recording":
+                await self.sdr.start_audio_recording()
+                await self._send_response(writer, 200, {"ok": True, "action": "start-audio-recording"})
+                return
+
+            if path == "/api/stop-audio-recording":
+                await self.sdr.stop_audio_recording()
+                await self._send_response(writer, 200, {"ok": True, "action": "stop-audio-recording"})
+                return
+
+            await self._send_response(writer, 404, {"ok": False, "error": "not_found"})
+        except ConnectionError as exc:
+            logging.warning("HTTP API SDRConnect command failed: %s", exc)
+            with contextlib.suppress(Exception):
+                await self._send_response(writer, 503, {"ok": False, "error": "sdrconnect_unavailable"})
+        except asyncio.IncompleteReadError:
+            logging.debug("HTTP API client disconnected early: %s", peer)
+        except ValueError:
+            with contextlib.suppress(Exception):
+                await self._send_response(writer, 400, {"ok": False, "error": "bad_request"})
+        finally:
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+
+    @staticmethod
+    async def _read_request(reader: asyncio.StreamReader) -> tuple[str, str, int]:
+        raw_headers = await reader.readuntil(b"\r\n\r\n")
+        header_text = raw_headers.decode("iso-8859-1")
+        lines = header_text.split("\r\n")
+        if not lines or not lines[0]:
+            raise ValueError("missing request line")
+
+        parts = lines[0].split()
+        if len(parts) != 3:
+            raise ValueError("invalid request line")
+        method, raw_path, _ = parts
+        path = raw_path.split("?", 1)[0]
+
+        content_length = 0
+        for line in lines[1:]:
+            if not line or ":" not in line:
+                continue
+            name, value = line.split(":", 1)
+            if name.strip().lower() == "content-length":
+                content_length = int(value.strip() or "0")
+        return method.upper(), path, content_length
+
+    @staticmethod
+    async def _send_response(
+        writer: asyncio.StreamWriter,
+        status_code: int,
+        payload: dict[str, str | bool],
+    ) -> None:
+        reason = {
+            200: "OK",
+            400: "Bad Request",
+            404: "Not Found",
+            405: "Method Not Allowed",
+            503: "Service Unavailable",
+        }.get(status_code, "OK")
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        response = (
+            f"HTTP/1.1 {status_code} {reason}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii")
+        writer.write(response + body)
+        await writer.drain()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Expose SDRConnect WebSocket frequency control as a rigctld-compatible TCP server."
     )
     parser.add_argument("--listen-host", default="0.0.0.0", help="rigctl TCP bind address")
     parser.add_argument("--listen-port", type=int, default=4532, help="rigctl TCP listen port")
+    parser.add_argument("--api-listen-host", default="0.0.0.0", help="HTTP API bind address")
+    parser.add_argument(
+        "--api-listen-port",
+        type=int,
+        default=4545,
+        help="HTTP API listen port; use 0 to disable the HTTP control API",
+    )
     parser.add_argument("--sdr-port", type=int, default=5454, help="local SDRConnect WebSocket port")
     parser.add_argument("--device", default="primary", choices=["primary", "secondary"], help="SDRConnect device")
     parser.add_argument(
@@ -565,6 +701,11 @@ async def main() -> None:
         refresh_interval=args.refresh_interval,
     )
     rigctl = RigctlServer(args.listen_host, args.listen_port, state, sdr)
+    api = (
+        ControlApiServer(args.api_listen_host, args.api_listen_port, sdr)
+        if args.api_listen_port > 0
+        else None
+    )
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -575,11 +716,15 @@ async def main() -> None:
 
     sdr_task = asyncio.create_task(sdr.run())
     rigctl_task = asyncio.create_task(rigctl.run())
+    api_task = asyncio.create_task(api.run()) if api is not None else None
     await stop.wait()
     sdr.stop()
-    for task in (sdr_task, rigctl_task):
+    tasks = [sdr_task, rigctl_task]
+    if api_task is not None:
+        tasks.append(api_task)
+    for task in tasks:
         task.cancel()
-    await asyncio.gather(sdr_task, rigctl_task, return_exceptions=True)
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 if __name__ == "__main__":

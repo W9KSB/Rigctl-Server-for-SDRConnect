@@ -11,6 +11,7 @@ WebSocket API.
 ## What It Does
 
 - Receives rigctl/Hamlib TCP commands on port `4532`
+- Exposes a small HTTP control API on port `4545`
 - Sends frequency, mode, and related control commands to SDRConnect over
   `127.0.0.1:5454`
 - Keeps frequency state bidirectional by listening for SDRConnect WebSocket
@@ -111,6 +112,36 @@ Port: 4532
 SDRConnect NetControl listens on `0.0.0.0:4532` by default, so clients can run
 on the same machine or another machine on the LAN.
 
+## HTTP Control API
+
+SDRConnect NetControl also listens on `0.0.0.0:4545` by default for a minimal
+HTTP API.
+
+Supported routes:
+
+- `POST /api/start-audio-recording`
+- `POST /api/stop-audio-recording`
+
+`POST /api/start-audio-recording` sends the SDRConnect commands needed to:
+
+1. unmute audio playback
+2. start the selected device stream
+3. start audio recording
+
+`POST /api/stop-audio-recording` sends the SDRConnect commands needed to:
+
+1. stop recording
+2. stop the selected device stream
+
+No request body is required.
+
+Example PowerShell calls:
+
+```powershell
+Invoke-WebRequest -Method Post http://127.0.0.1:4545/api/start-audio-recording
+Invoke-WebRequest -Method Post http://127.0.0.1:4545/api/stop-audio-recording
+```
+
 ## Command Line Options
 
 ### `--listen-host ADDRESS` (default: `0.0.0.0`)
@@ -120,6 +151,14 @@ Address for the rigctl/Hamlib TCP listener.
 ### `--listen-port PORT` (default: `4532`)
 
 Port for the rigctl/Hamlib TCP listener.
+
+### `--api-listen-host ADDRESS` (default: `0.0.0.0`)
+
+Address for the HTTP control API listener.
+
+### `--api-listen-port PORT` (default: `4545`)
+
+Port for the HTTP control API listener. Use `0` to disable it.
 
 ### `--sdr-port PORT` (default: `5454`)
 
@@ -156,6 +195,12 @@ Run with verbose logging:
 python3 ./sdrconnect_netcontrol.py --verbose
 ```
 
+Disable the HTTP control API:
+
+```bash
+python3 ./sdrconnect_netcontrol.py --api-listen-port 0
+```
+
 Use a different rigctl listener port:
 
 ```bash
@@ -176,9 +221,15 @@ The Hamlib side listens for TCP clients on port `4532`. A compatible client
 connects to that listener and sends rigctl-style commands such as setting or
 reading the current frequency.
 
+The HTTP side listens for POST requests on port `4545`. It exposes two
+purpose-built endpoints for starting and stopping audio recording without
+requiring callers to know the underlying SDRConnect WebSocket messages.
+
 The SDRConnect side connects to SDRConnect's local WebSocket API at
 `127.0.0.1:5454`. It sends SDRConnect `set_property` and `get_property` JSON
-messages to control the tuned frequency and read the current state.
+messages to control the tuned frequency and read the current state, plus
+`device_stream_enable`, `start_recording`, and `stop_recording` events for the
+HTTP recording API.
 
 SDRConnect's WebSocket API is intentionally accessed only through localhost.
 That keeps the SDRConnect API off the LAN while still allowing compatible
@@ -228,6 +279,19 @@ netstat -ano -p tcp | findstr :4532
 
 If the client is on another machine, Windows Firewall may need an inbound rule
 allowing TCP port `4532` on private networks.
+
+### HTTP API client cannot connect
+
+Make sure SDRConnect NetControl is listening on port `4545`.
+
+On Windows:
+
+```powershell
+netstat -ano -p tcp | findstr :4545
+```
+
+If the caller is on another machine, Windows Firewall may need an inbound rule
+allowing TCP port `4545` on private networks.
 
 ### Need more detail
 
